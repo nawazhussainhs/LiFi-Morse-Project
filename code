@@ -1,0 +1,318 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- HARDWARE CONFIGURATION ---
+const int LDR_PIN = A0;          // Analog pin connected to the LDR sensor
+const int LCD_COLS = 16;         // 16 columns
+const int LCD_ROWS = 2;          // 2 rows
+const int LCD_ADDRESS = 0x27;    // I2C address for the LCD
+
+// --- MORSE TIMING CONSTANTS ---
+const unsigned long DOT_UNIT_MS = 100;
+
+const unsigned long THRESHOLD_DOT_MAX_MS  = DOT_UNIT_MS * 1.5;
+const unsigned long THRESHOLD_DASH_MIN_MS = DOT_UNIT_MS * 3;
+
+const unsigned long THRESHOLD_ELEMENT_SPACE_MAX_MS = DOT_UNIT_MS * 1;
+const unsigned long THRESHOLD_CHAR_SPACE_MIN_MS    = DOT_UNIT_MS * 3;
+// Adjusted WORD_SPACE to be clearly distinct from CHAR_SPACE (7 * DOT_UNIT is standard)
+const unsigned long THRESHOLD_WORD_SPACE_MIN_MS    = DOT_UNIT_MS * 7; 
+
+// --- LDR SENSITIVITY --
+const int LIGHT_THRESHOLD = 550;  // Calibrate as needed
+
+// --- STATE VARIABLES ---
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+
+String currentMorse = "";   // Current morse sequence (dots/dashes)
+String rawMessage = "";     // Message with spaces inserted ONLY by timing
+String receivedMessage = ""; // Auto-spaced message shown on LCD
+
+unsigned long lastEventTime = 0;  // Last light state change time
+bool isLightOn = false;           // Current light status
+
+// Morse code map for decoding
+struct MorseCode {
+  const char* morse;
+  char character;
+};
+
+const MorseCode morseMap[] = {
+  {".-", 'A'}, {"-...", 'B'}, {"-.-.", 'C'}, {"-..", 'D'},
+  {".", 'E'}, {"..-.", 'F'}, {"--.", 'G'}, {"....", 'H'},
+  {"..", 'I'}, {".---", 'J'}, {"-.-", 'K'}, {".-..", 'L'},
+  {"--", 'M'}, {"-.", 'N'}, {"---", 'O'}, {".--.", 'P'},
+  {"--.-", 'Q'}, {".-.", 'R'}, {"...", 'S'}, {"-", 'T'},
+  {"..-", 'U'}, {"...-", 'V'}, {".--", 'W'}, {"-..-", 'X'},
+  {"-.--", 'Y'}, {"--..", 'Z'},
+  {"-----", '0'}, {".----", '1'}, {"..---", '2'}, {"...--", '3'},
+  {"....-", '4'}, {".....", '5'}, {"-....", '6'}, {"--...", '7'},
+  {"---..", '8'}, {"----.", '9'},
+  {".-.-.-", '.'}, {"--..--", ','}, {"..-..", '?'}, {"-.-.--", '!'},
+  {"-....-", '-'}, {".--.-.", '@'}, {"-.-.", 'X'} // 'X' as unknown
+};
+const int MORSE_MAP_SIZE = sizeof(morseMap) / sizeof(morseMap[0]);
+
+// --- SMALL DICTIONARY FOR AUTO-SPACING ---
+// Add any words you expect to send frequently. Added 'GET' and 'HER' for the user's scenario.
+const char* WORD_DICT[] = {
+  "HELLO",
+  "WORLD",
+  "HI",
+  "TEST",
+  "LIFI",
+  "MORSE",
+  "CODE",
+  "SOS",
+  "THIS",
+  "IS",
+  "A",
+  "DEMO",
+  "TO", 
+  "GET", 
+  "HER", 
+  "TOGETHER",
+  "NAWAZ",
+  "MANUKONDA",
+  "VIVEKANANDA",
+  "REDDY",
+  "AADESH",
+  "RAKESH",
+  "MANJUNATH",
+  "SUNDARI",
+  ""
+};
+const int WORD_DICT_SIZE = sizeof(WORD_DICT) / sizeof(WORD_DICT[0]);
+
+// --- FUNCTION PROTOTYPES ---
+void decodeAndDisplay(bool isWordSpace);
+char morseDecode(String morseCode);
+void updateLCD();
+String autoSpace(const String &input);
+bool isInDictionary(const String &word);
+String processSegment(const String &segment); // New helper function
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Morse Code LiFi Receiver Initializing...");
+
+  // Initialize LCD
+  lcd.begin();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("LIFI DECODER");
+  lcd.setCursor(0, 1);
+  lcd.print("READY");
+
+  // Read initial LDR state
+  int initialReading = analogRead(LDR_PIN);
+  isLightOn = (initialReading < LIGHT_THRESHOLD);
+  lastEventTime = millis();
+}
+
+void loop() {
+  int ldrValue = analogRead(LDR_PIN);
+
+  // Debug via Serial
+  //Serial.print("LDR: ");
+  //Serial.println(ldrValue);
+
+  bool newLightOn = (ldrValue < LIGHT_THRESHOLD);
+  unsigned long currentTime = millis();
+  unsigned long duration = currentTime - lastEventTime;
+
+  if (newLightOn != isLightOn) {
+    // State changed (ON to OFF or OFF to ON)
+    if (isLightOn) {
+      // Light just turned off, record dot or dash
+      if (duration < THRESHOLD_DOT_MAX_MS) {
+        currentMorse += ".";
+        Serial.print(".");
+      } else {
+        currentMorse += "-";
+        Serial.print("-");
+      }
+    } else {
+      // Light just turned on, check for end of letter/word
+      if (duration >= THRESHOLD_CHAR_SPACE_MIN_MS) {
+        bool isWordSpace = (duration >= THRESHOLD_WORD_SPACE_MIN_MS);
+        decodeAndDisplay(isWordSpace);
+      }
+    }
+    isLightOn = newLightOn;
+    lastEventTime = currentTime;
+  } else {
+    // No state change, check for timeout end of letter/word
+    // This is for the case where the light is OFF for a very long time
+    if (!isLightOn && duration >= THRESHOLD_CHAR_SPACE_MIN_MS && currentMorse.length() > 0) {
+      bool isWordSpace = (duration >= THRESHOLD_WORD_SPACE_MIN_MS);
+      decodeAndDisplay(isWordSpace);
+      if (isWordSpace) {
+        // Prevent rapid-fire word spaces from continuous long off-time
+        lastEventTime = currentTime;
+      }
+    }
+  }
+}
+
+/**
+ * @brief Decodes the current Morse buffer, updates rawMessage,
+ * then computes best positions for spaces based on dictionary.
+ * @param isWordSpace True if the gap detected was a word space.
+ */
+void decodeAndDisplay(bool isWordSpace) {
+  if (currentMorse.length() > 0) {
+    char decodedChar = morseDecode(currentMorse);
+
+    // Add decoded character to RAW message (no spacing logic here)
+    rawMessage += decodedChar;
+
+    Serial.print(" -> ");
+    Serial.println(decodedChar);
+
+    // CRITICAL: If timing suggests a word gap, add a space to rawMessage. 
+    // This space MUST be respected by autoSpace().
+    if (isWordSpace) {
+      // Only add a space if the last character wasn't already a space (avoids double spaces)
+      if (rawMessage.length() > 0 && rawMessage[rawMessage.length() - 1] != ' ') {
+        rawMessage += ' '; 
+        Serial.println(" (Word Space Detected by Timing)");
+      }
+    }
+
+    // Now compute the "best guess" spaced message
+    receivedMessage = autoSpace(rawMessage);
+
+    currentMorse = "";
+    updateLCD();
+  }
+}
+
+/**
+ * @brief Decodes a single Morse code string into a character.
+ * @param morseCode The Morse string (e.g., ".-")
+ * @return The decoded character, or '?' if not found.
+ */
+char morseDecode(String morseCode) {
+  for (int i = 0; i < MORSE_MAP_SIZE; i++) {
+    if (strcmp(morseMap[i].morse, morseCode.c_str()) == 0) {
+      return morseMap[i].character;
+    }
+  }
+  return '?'; // Unknown character
+}
+
+/**
+ * @brief Splits the input by existing spaces (from timing) and applies 
+ * dictionary spacing to each segment.
+ */
+String autoSpace(const String &input) {
+  String result = "";
+  String segment = "";
+
+  for (int i = 0; i < input.length(); i++) {
+    if (input[i] == ' ') {
+      // Hard boundary detected (by timing)
+      if (segment.length() > 0) {
+        result += processSegment(segment); // Process the collected segment
+        segment = "";
+      }
+      // Add the space back, ensuring no double spaces
+      if (result.length() > 0 && result[result.length() - 1] != ' ') {
+        result += ' ';
+      }
+    } else {
+      segment += input[i];
+    }
+  }
+
+  // Process the last segment (if any)
+  if (segment.length() > 0) {
+    if (result.length() > 0 && result[result.length() - 1] != ' ') {
+        // If segment is preceded by a space and the segment itself is a dictionary word, 
+        // we should not add an extra space here. The segment is just appended.
+    }
+    result += processSegment(segment);
+  }
+
+  // Trim trailing space if any
+  if (result.length() > 0 && result[result.length() - 1] == ' ') {
+    result.remove(result.length() - 1);
+  }
+
+  return result;
+}
+
+/**
+ * @brief Applies the greedy dictionary algorithm to a single segment of characters 
+ * (a string with NO spaces). This is the original autoSpace core logic.
+ */
+String processSegment(const String &segment) {
+    String result = "";
+    int n = segment.length();
+    int i = 0;
+
+    while (i < n) {
+        int bestLen = -1;
+
+        // Try longest possible word from position i
+        for (int len = n - i; len >= 1; len--) {
+            String candidate = segment.substring(i, i + len);
+            if (isInDictionary(candidate)) {
+                bestLen = len;
+                break;
+            }
+        }
+
+        if (bestLen > 0) {
+            // Found a dictionary word
+            if (result.length() > 0 && result[result.length() - 1] != ' ') {
+                result += ' '; // Add space before a new word
+            }
+            result += segment.substring(i, i + bestLen);
+            i += bestLen;
+        } else {
+            // No word found: just copy this char
+            // This is the fallback for unknown words/characters
+            result += segment[i];
+            i++;
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Check if a word (uppercase) is in the small dictionary.
+ */
+bool isInDictionary(const String &word) {
+  for (int i = 0; i < WORD_DICT_SIZE; i++) {
+    if (word.equals(WORD_DICT[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * @brief Updates the LCD screen with the current message.
+ */
+void updateLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("MSG:");
+
+  // Optionally show current Morse being received on first line
+  lcd.print(currentMorse);
+
+  lcd.setCursor(0, 1);
+  int msgLen = receivedMessage.length();
+
+  // Scroll the message if it's longer than the display
+  if (msgLen > LCD_COLS) {
+    // Show the last LCD_COLS characters
+    lcd.print(receivedMessage.substring(msgLen - LCD_COLS));
+  } else {
+    lcd.print(receivedMessage);
+  }
+}
